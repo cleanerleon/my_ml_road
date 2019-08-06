@@ -5,6 +5,13 @@ import pandas as pd
 import numpy as np
 import random as rnd
 import re
+import concurrent.futures
+import platform
+import pickle
+import os
+import traceback
+import itertools
+import multiprocessing
 
 # visualization
 import seaborn as sns
@@ -23,73 +30,221 @@ from sklearn.ensemble import RandomForestClassifier, VotingClassifier, BaggingCl
 from sklearn.preprocessing import Imputer, Normalizer, scale
 from sklearn.model_selection import train_test_split , StratifiedKFold
 from sklearn.feature_selection import RFECV
+from sklearn.preprocessing import OneHotEncoder
+from scipy import sparse
+from sklearn.metrics import accuracy_score
 
 import xgboost as xgb
 import gzip
 import lightgbm as lgbm
+
+def load_pickle(path):
+    if platform.system() == 'Linux':
+        path = path.replace('\\', '/')
+    else:
+        path = path.replace('/', '\\')
+
+    if os.path.exists(path) and os.path.getsize(path) > 0:
+        with open(path, 'rb') as f:
+            return pickle.load(f)
+    return None
+
+
+def save_pickle(obj, path):
+    if platform.system() == 'Linux':
+        path = path.replace('\\', '/')
+    else:
+        path = path.replace('/', '\\')
+
+    with open(path, 'wb') as f:
+        pickle.dump(obj, f)
 
 
 def read_csv_gz(path, *params):
     with gzip.open(path, 'rb') as f:
         return pd.read_csv(f, *params)
 
+
 train_path = r'train.csv.gz'
 test_path = r'test.csv.gz'
 seed = 0
 folds = 10
 
-train_df = read_csv_gz(train_path)
-test_df = read_csv_gz(train_path)
+def process(df):
+    drop_cols = ['Name']
 
-train_y = train_df['Survived']
-train_X = train_df.drop(['PassengerId', 'Survived'])
+    # Pclass: no na, 1,2,3
 
-test_id = test_df['PassengerId']
-test_X = test_df.drop(['PassengerId', 'Survived'])
+    # Name:
+    df['Title'] = df['Name'].str.extract(r' (\w+)\.')
+    title_set = set(('Mr', 'Miss', 'Mrs', 'Master'))
+    df['Title'] = df['Title'].map(lambda x: x if x in title_set else 'Other')
 
-all_X = pd.concat([train_X, test_X], sort=False)
+    # Age
+    df['Age'].fillna(-1, inplace=True)
+    df['Age'] = df['Age'].map(lambda x: x // 5 if x // 5 < 13 else 13)
 
-cat_cols = ['Pclass', 'Title', 'Sex', 'Age', 'SibSp', 'Parch', 'Ticket']
-drop_cols = ['Name']
+    # SibSp
+    df['SibSp'] = df['SibSp'].map(lambda x: x if x < 5 else 5)
 
-# Index(['PassengerId', 'Survived', 'Pclass', 'Name', 'Sex', 'Age', 'SibSp',
-#        'Parch', 'Ticket', 'Fare', 'Cabin', 'Embarked'],
-#       dtype='object')
+    # Parch
+    df['Parch'] = df['Parch'].map(lambda x: x if x < 3 else 3)
 
-# Pclass: no na, 1,2,3
+    # Ticket
+    tickets = df["Ticket"].value_counts()
+    tickets_set = set(tickets[tickets>1].index)
+    df['Ticket'] = df['Ticket'].map(lambda x: x if x in tickets_set else 'Others')
 
-# Name:
-all_X['Title'] = all_X['Name'].str.extract(r' (\w+)\.')
-title_set = set(('Mr', 'Miss', 'Mrs', 'Master'))
-all_X['Title'] = all_X['Title'].map(lambda x: x if x in title_set else 'Other')
+    # Fare
+    df['Fare'].fillna(-1, inplace=True)
+    df['Fare'] = df['Fare'].map(lambda x: x // 1 if x <= 30 else x // 5 + 30 if x <= 100 else 100)
 
-# Age
-all_X['Age'].fillna(-1, inplace=True)
-all_X['Age'] = all_X['Age'].map(lambda x: x//5 if x//5 < 13 else 13)
+    # Cabin
+    df['Cabin'].fillna('Others', inplace=True)
+    cabins = df["Cabin"].value_counts()
+    cabins_set = set(cabins[cabins>1].index)
+    df['Cabin'] = df['Cabin'].map(lambda x: x if x in cabins_set else 'Others')
 
-# SibSp
-all_X['SibSp'] = all_X['SibSp'].map(lambda x: x if x < 5 else 5)
+    # Embarked: na 2
+    df['Embarked'].fillna('Others', inplace=True)
+    df.drop(drop_cols, inplace=True, axis=1)
 
-# Parch
-all_X['Parch'] = all_X['Parch'].map(lambda x: x if x < 3 else 3)
+    # add count columns
+    cnt_cols = []
+    cat_cols = list(df.columns)
+    for col in df.columns:
+        cnt_col = col + ' cnt'
+        cnt_cols.append(cnt_col)
+        df[cnt_col] = df[col].map(df[col].value_counts())
 
-# Ticket
-tickets = all_X["Ticket"].value_counts()
-tickets_set = set(tickets[tickets>1].index)
-all_X['Ticket'] = all_X['Ticket'].map(lambda x: x if x in tickets_set else 'Others')
+    # df['count'] = 0
+    # for col in cat_cols:
+    #     cnt_df = df.groupby([col, 'Survived']).agg({'count': 'count'})
+    #     cnt_map = {}
+    #     for key in cnt_df.index.levels[0]:
+    #         item = [cnt_df.loc[(key, key2), 'count'] if (key, key2) in cnt_df else 0 for key2 in (0, 1, -1) ]
+    #         cnt_map[key] = item
+    #     idx = 0
+    #     for i in (0, 1, -1):
+    #         col_name = col + ' ' + str(i) + ' cnt'
+    #         df[col_name] = df[col].map(lambda x: cnt_map[x][idx])
+    #         idx += 1
+    #         cnt_cols.append(col_name)
+    # print(cat_cols)
+    # print(cnt_cols)
+    ohe = OneHotEncoder()
+    X1 = ohe.fit_transform(df[cat_cols])
+    X2 = sparse.csr_matrix(df[cnt_cols])
+    df = sparse.hstack([X1, X2])
+    return df.tocsr()
 
-# Fare
-all_X['Fare'].fillna(-1, inplace=True)
-all_X['Fare'] = all_X['Fare'].map(lambda  x: x//1 if x <= 30 else x//5 + 30 if x <= 100 else 100)
+def lgb_eval(path, lgb_param):
+    print(lgb_param)
+    X, y = load_pickle(path)
+    clf = lgbm.LGBMClassifier(random_state=0, n_jobs=-1, objective='binary', tree_learner='data', **lgb_param)
+    result = cross_val_score(clf, X, y, n_jobs=-1, scoring='accuracy', cv=5)
+    print(result, lgb_param)
+    return result
 
-# Cabin
-all_X['Cabin'].fillna('Others', inplace=True)
-cabins = all_X["Cabin"].value_counts()
-cabins_set = set(cabins[cabins>1].index)
-all_X['Cabin'] = all_X['Cabin'].map(lambda x: x if x in cabins_set else 'Others')
+def lgb_test(train_X, train_y, test_X, test_y):
+    clf = lgbm.LGBMClassifier(random_state=0, n_jobs=-1, objective='binary', tree_learner='data')
+    clf.fit(train_X, train_y)
+    pred_y = clf.predict(test_X)
+    print('accuracy', accuracy_score(test_y, pred_y))
 
-# Embarked: na 2
-all_X['Embarked'].fillna('Others', inplace=True)
+def lgb_grid(X, y):
+    print('lgb grid search')
+    path = r'sav\lgb-grid.pck'
+    result_map = load_pickle(path)
+    if result_map is None:
+        result_map = {}
+    params = {
+        'n_estimators': [100],
+        'num_leaves': [31],
+        'colsample_bytree': [.6, .8, 1],
+        'reg_alpha': [0, .01, .1, 1],
+        'reg_lambda': [0, .01, .1, 1],
+        'min_child_weight': [.001, .01, .1, 1],
+        'min_child_samples': [1, 10, 20, 100],
+        'subsample_freq': [1],
+        'subsample': [.6, .8, 1],
+    }
+    param_grid = itertools.product(*(params[key] for key in params.keys()))
+    mp_param_list = []
+    best_value, best_params = 0, None
+    for param in param_grid:
+        lgb_param = {k: v for k, v in zip(params.keys(), param)}
+        key = str(lgb_param)
+        if key in result_map:
+            value = result_map[key]
+            if value.mean() > best_value:
+                best_value = value.mean()
+                best_params = key
+            continue
+        mp_param_list.append(lgb_param)
+    mp_param_list.reverse()
+
+    dat = X, y
+    dat_path = r'sav/dat.pck'
+    save_pickle(dat, dat_path)
+    print('best value %s, params %s' % (best_value, best_params))
+    with concurrent.futures.ProcessPoolExecutor(max_workers=multiprocessing.cpu_count()-1) as executor:
+        worker_map = {executor.submit(lgb_eval, dat_path, lgb_param): str(lgb_param) for lgb_param in mp_param_list}
+        for future in concurrent.futures.as_completed(worker_map):
+            key = worker_map[future]
+            try:
+                result = future.result()
+            except Exception as e:
+                print(e)
+                traceback.print_exc()
+            else:
+                result_map[key] = result
+                save_pickle(result_map, path)
+                print('accuracy ', result.max(), result.mean())
+
+    result = [(v.mean(), v, k) for k, v in result_map.items()]
+    result.sort(key=lambda x: x[0], reverse=True)
+    for item in result[:10]:
+        print(item)
+
+# without cnt columns
+# ("{'n_estimators': 100, 'num_leaves': 31}", array([0.7877095 , 0.81005587, 0.87640449, 0.80898876, 0.82485876]), 0.821603475723521)
+# with cnt columns
+# ("{'n_estimators': 100, 'num_leaves': 31}", array([0.82681564, 0.7877095 , 0.84269663, 0.8258427 , 0.84745763]), 0.8261044185252292)
+
+def train():
+    df = read_csv_gz(train_path)
+    df_X = df.drop(['PassengerId', 'Survived'], axis=1)
+    df_y = df['Survived']
+    df_X = process(df_X)
+    lgb_grid(df_X, df_y)
+
+def test():
+    params = {'n_estimators': 4000, 'num_leaves': 127, 'colsample_bytree': 0.8, 'reg_alpha': 0.01, 'reg_lambda': 0.1, 'min_child_weight': 1, 'min_child_samples': 1, 'subsample_freq': 1, 'subsample': 1}
+    # params = {'n_estimators': 100, 'num_leaves': 31, 'colsample_bytree': 0.6, 'reg_alpha': 0, 'reg_lambda': 0.1, 'min_child_weight': 1, 'min_child_samples': 1, 'subsample_freq': 1, 'subsample': 0.8}
+    train_df = read_csv_gz(train_path)
+    test_df = read_csv_gz(test_path)
+    train_y = train_df['Survived']
+    test_id = test_df['PassengerId']
+    all_df = pd.concat([train_df, test_df], sort=False).reset_index(drop=True)
+    all_X = all_df.drop(['PassengerId', 'Survived'], axis=1)
+    all_X = process(all_X)
+    train_len = len(train_df)
+    train_X = all_X[:train_len]
+    test_X = all_X[train_len:]
+    clf = lgbm.LGBMClassifier(random_state=0, n_jobs=-1, objective='binary', tree_learner='data', **params)
+    clf.fit(train_X, train_y)
+    pred_y = clf.predict(test_X)
+    pred_df = pd.concat({'PassengerId': test_id, 'Survived':pd.Series(pred_y)}, axis=1)
+    pred_df.to_csv('result.csv', index=False)
+
+
+if __name__ == '__main__':
+    __spec__ = 'Titanic'
+    print('start')
+    test()
+
+
 
 # kfold = KFold(n_splits=folds, random_state=seed)
 #
